@@ -1,0 +1,209 @@
+name: Build a plugin
+
+on:
+  workflow_call:
+    inputs:
+      plugin:
+        description: "Plugin directory name (e.g. BaseSixFour)"
+        required: true
+        type: string
+      release:
+        description: "If true, upload artifacts to a GitHub Release"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Tag for the release (e.g. basesixfour-v1.0.0)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  NDK_TARBALL_URL: https://smack.s3.ap-southeast-1.amazonaws.com/nuke-ndk-15.2v9.tar.gz
+  NDK_VERSION: 15.2v9
+
+jobs:
+  build:
+    name: ${{ inputs.plugin }} / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            os: windows-2022
+            platform_dir: windows_x86_64
+            artifact_suffix: windows-x86_64
+            plugin_ext: dll
+          - name: macOS arm64
+            os: macos-14
+            platform_dir: macos_arm64
+            artifact_suffix: macos-arm64
+            plugin_ext: dylib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify plugin directory exists
+        shell: bash
+        run: |
+          if [[ ! -d "${{ inputs.plugin }}" ]]; then
+            echo "Plugin directory '${{ inputs.plugin }}' not found in repo root."
+            echo "Available directories:"
+            ls -d */ 2>/dev/null || true
+            exit 1
+          fi
+          if [[ ! -f "${{ inputs.plugin }}/CMakeLists.txt" ]]; then
+            echo "No CMakeLists.txt in ${{ inputs.plugin }}/"
+            exit 1
+          fi
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Download NDK tarball
+        shell: bash
+        run: |
+          curl -fsSL -o ndk.tar.gz "$NDK_TARBALL_URL"
+          ls -lh ndk.tar.gz
+
+      - name: Extract NDK
+        shell: bash
+        run: |
+          mkdir -p ndk
+          tar -xzf ndk.tar.gz -C ndk
+          echo "--- Platform dir ---"
+          ls -la "ndk/nuke-ndk-${NDK_VERSION}/${{ matrix.platform_dir }}/"
+
+      - name: Resolve NUKE_ROOT
+        shell: bash
+        run: |
+          NUKE_ROOT="$GITHUB_WORKSPACE/ndk/nuke-ndk-${NDK_VERSION}/${{ matrix.platform_dir }}"
+          echo "NUKE_ROOT=$NUKE_ROOT" >> "$GITHUB_ENV"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: ${{ inputs.plugin }}
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNUKE_ROOT="$NUKE_ROOT" \
+            -G "Visual Studio 17 2022" -A x64
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: ${{ inputs.plugin }}
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNUKE_ROOT="$NUKE_ROOT" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -G Ninja
+
+      - name: Build
+        shell: bash
+        working-directory: ${{ inputs.plugin }}
+        run: cmake --build build --config Release --parallel
+
+      - name: Locate built plugin(s)
+        id: locate
+        shell: bash
+        working-directory: ${{ inputs.plugin }}
+        run: |
+          # A plugin CMakeLists may produce multiple .dll/.dylib targets.
+          # We gather them all and zip them for the artifact.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            SEARCH_DIR="build/Release"
+          else
+            SEARCH_DIR="build"
+          fi
+          mkdir -p _stage
+          # Only top-level build outputs, not FetchContent'd dependencies.
+          find "$SEARCH_DIR" -maxdepth 1 -name "*.${{ matrix.plugin_ext }}" -type f -exec cp {} _stage/ \;
+          COUNT=$(ls _stage | wc -l | tr -d ' ')
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No .${{ matrix.plugin_ext }} files built."
+            find build -name "*.${{ matrix.plugin_ext }}" -type f
+            exit 1
+          fi
+          echo "Built $COUNT file(s):"
+          ls -lh _stage
+
+      - name: Verify plugin (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: ${{ inputs.plugin }}
+        run: |
+          for f in _stage/*.dylib; do
+            echo "--- $f ---"
+            file "$f"
+            otool -L "$f"
+            echo ""
+          done
+
+      - name: Verify plugin (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ inputs.plugin }}
+        run: |
+          Get-ChildItem _stage\*.dll | ForEach-Object {
+            Write-Host "--- $($_.Name) ---"
+            Write-Host "Size: $($_.Length) bytes"
+            dumpbin /DEPENDENTS $_.FullName
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.plugin }}-${{ matrix.artifact_suffix }}
+          path: ${{ inputs.plugin }}/_stage/*
+          if-no-files-found: error
+
+  release:
+    name: Release ${{ inputs.plugin }}
+    needs: build
+    if: inputs.release == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ inputs.plugin }}-*
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          # Rename per-platform so collisions (e.g. same filename on both) don't clobber.
+          for dir in artifacts/${{ inputs.plugin }}-*; do
+            suffix="${dir##*-}"   # e.g. "x86_64" -- actually whole "windows-x86_64" etc
+            platform=$(basename "$dir" | sed "s/^${{ inputs.plugin }}-//")
+            for f in "$dir"/*; do
+              base=$(basename "$f")
+              name="${base%.*}"
+              ext="${base##*.}"
+              cp "$f" "release/${name}-${platform}.${ext}"
+            done
+          done
+          ls -la release
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

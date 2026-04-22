@@ -1,0 +1,42 @@
+# Build outputs (inside any plugin subdirectory)
+*/build/
+*/cmake-build-*/
+*/_stage/
+*/out/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.sln
+*.vcxproj*
+*.filters
+
+# Compiled plugin binaries
+*.dll
+*.dylib
+*.so
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# NDK tarball (pulled fresh in CI)
+ndk.tar.gz
+ndk/
+nuke-ndk-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
