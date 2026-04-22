@@ -29,9 +29,38 @@ cmake -S . -B build -DNUKE_ROOT=/Applications/Nuke15.2v9/Nuke15.2v9.app/Contents
 cmake --build build --config Release
 ```
 
-### In CI (recommended)
+### In CI via build.py (the "one-button" way)
 
-The repo has two workflows:
+The simplest way to build is via `build.py`. It triggers the workflow,
+polls until done, and downloads the binaries to your Downloads folder.
+
+```bash
+pip install requests
+
+# Build the default plugin (BaseSixFour)
+python build.py
+
+# Build a specific plugin
+python build.py --plugin Loki
+
+# Skip the build and just grab artifacts from the most recent successful run
+python build.py --plugin BaseSixFour --download
+```
+
+The script needs a GitHub Personal Access Token with `Actions: write` and
+`Contents: read` scopes on this repo. Token resolution order:
+
+1. `--token <TOKEN>`
+2. `$GITHUB_TOKEN` environment variable
+3. An empty folder named `github_pat_<rest-of-token>` sitting next to the
+   script (a low-tech way to stash the token without env vars)
+
+Binaries land in `~/Downloads/<plugin-name>/` by default; pass
+`--download-dir` to override.
+
+### In CI via the web UI
+
+If you'd rather click buttons:
 
 - **`.github/workflows/release.yml`** — orchestrator. Two triggers:
   1. **Manual dispatch** — go to Actions tab, pick "Build / Release", choose a
@@ -79,6 +108,8 @@ name via a table in `release.yml`.
 scripts/
   assemble-ndk-windows_x86_64.ps1  # Pull Windows NDK bits from a Nuke install
   assemble-ndk-macos_arm64.ps1     # Pull macOS NDK bits from a mounted .dmg
+
+build.py                # One-button: trigger CI, poll, download binaries
 
 BaseSixFour/
   CMakeLists.txt

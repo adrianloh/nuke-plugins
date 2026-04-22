@@ -40,3 +40,6 @@ nuke-ndk-*/
 # Python
 __pycache__/
 *.pyc
+
+# Token-stash folders for build.py (see README)
+github_pat_*/
