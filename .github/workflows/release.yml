@@ -28,10 +28,14 @@ permissions:
 
 jobs:
   # --- Manual build (dispatch) ----------------------------------------
+  # Note: we do NOT narrow permissions here. The reusable workflow
+  # build-plugin.yml statically declares a 'release' job needing
+  # contents:write, and GitHub validates that at parse time before
+  # any 'if:' conditions are evaluated. Narrowing here would fail
+  # validation even though the release job won't actually run for
+  # a dispatch build (release: false).
   dispatch-build:
     if: github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: read
     uses: ./.github/workflows/build-plugin.yml
     with:
       plugin: ${{ inputs.plugin }}
