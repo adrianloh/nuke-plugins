@@ -233,11 +233,109 @@ def wait_for_run(token: str, username: str, trigger_time: float,
             if conclusion == "success":
                 log(f"Build finished successfully in {elapsed}s.")
             else:
-                sys.exit(f"ERROR: Build finished with conclusion '{conclusion}'.\n"
-                         f"       Check: {run['html_url']}")
+                # Surface everything useful for debugging: live URL, log
+                # download links, and auto-saved log files.
+                report_failure(token, username, run, jobs_url)
+                sys.exit(1)
             return run
 
         time.sleep(POLL_INTERVAL_SEC)
+
+
+def report_failure(token: str, username: str, run: dict, jobs_url: str) -> None:
+    """On workflow failure, print everything useful for debugging and
+    auto-download the log files for any failed job(s) to the current
+    directory so they can be shared easily."""
+    run_id = run["id"]
+    html_url = run["html_url"]
+
+    print("")
+    print("=" * 70)
+    print(f"  BUILD FAILED (run #{run['run_number']}, conclusion: {run['conclusion']})")
+    print("=" * 70)
+    print(f"  Live URL:  {html_url}")
+    print("")
+
+    # --- Per-job status + log URLs ------------------------------------------
+    jr = requests.get(jobs_url, headers=api_headers(token), timeout=30)
+    failed_jobs = []
+    if jr.ok:
+        jobs = jr.json().get("jobs", [])
+        print(f"  Jobs:")
+        for job in jobs:
+            name = job.get("name", "?")
+            conc = job.get("conclusion") or job.get("status")
+            print(f"    [{conc:>9}]  {name}")
+            if job.get("conclusion") not in (None, "success", "skipped"):
+                failed_jobs.append(job)
+                # Identify the first failed step for a quick pointer
+                for step in job.get("steps") or []:
+                    if step.get("conclusion") not in (None, "success", "skipped"):
+                        print(f"                first failing step: "
+                              f"\"{step.get('name')}\" "
+                              f"({step.get('conclusion')})")
+                        break
+
+    # --- Download logs of failed jobs to cwd --------------------------------
+    # GitHub provides per-job logs as plain text via:
+    #   GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs
+    # This 302's to a short-lived blob URL.
+    downloaded: list[Path] = []
+    errors: list[str] = []
+    out_dir = Path.cwd()
+    for job in failed_jobs:
+        job_id = job["id"]
+        # Safe filename: replace anything non-alphanum/dash/underscore
+        safe = "".join(c if c.isalnum() or c in "-_" else "_"
+                       for c in job.get("name", f"job-{job_id}"))
+        out_path = out_dir / f"failed-run-{run['run_number']}-{safe}.log"
+        try:
+            log_url = (f"https://api.github.com/repos/{username}/{REPO_NAME}"
+                       f"/actions/jobs/{job_id}/logs")
+            lr = requests.get(log_url, headers=api_headers(token),
+                              allow_redirects=True, stream=True, timeout=60)
+            lr.raise_for_status()
+            with open(out_path, "wb") as f:
+                for block in lr.iter_content(chunk_size=64 * 1024):
+                    if block:
+                        f.write(block)
+            downloaded.append(out_path)
+        except Exception as e:
+            errors.append(f"{safe}: {e}")
+
+    # --- Also fetch the full zipped logs for the whole run ------------------
+    zip_path = out_dir / f"failed-run-{run['run_number']}-all-logs.zip"
+    try:
+        logs_url = (f"https://api.github.com/repos/{username}/{REPO_NAME}"
+                    f"/actions/runs/{run_id}/logs")
+        zr = requests.get(logs_url, headers=api_headers(token),
+                          allow_redirects=True, stream=True, timeout=120)
+        zr.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for block in zr.iter_content(chunk_size=64 * 1024):
+                if block:
+                    f.write(block)
+        downloaded.append(zip_path)
+    except Exception as e:
+        errors.append(f"full-run-logs.zip: {e}")
+
+    print("")
+    if downloaded:
+        print("  Logs downloaded to current directory:")
+        for p in downloaded:
+            size_kb = p.stat().st_size / 1024
+            print(f"    {p.name}  ({size_kb:,.0f} KB)")
+    if errors:
+        print("")
+        print("  Could not download these logs (API may be rate-limited):")
+        for e in errors:
+            print(f"    - {e}")
+        print("")
+        print("  Browser fallback - download logs from:")
+        print(f"    {html_url}")
+    print("")
+    print("  Share the .log or .zip file for debugging.")
+    print("=" * 70)
 
 
 # --- Artifacts ---------------------------------------------------------------
