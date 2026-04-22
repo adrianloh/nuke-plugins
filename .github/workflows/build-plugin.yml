@@ -32,7 +32,7 @@ jobs:
         include:
           - name: Windows x86_64
             os: windows-2022
-            platform_dir: windows_x86_64
+            platform_dir: windows
             artifact_suffix: windows-x86_64
             plugin_ext: dll
           - name: macOS arm64

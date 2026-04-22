@@ -3,6 +3,7 @@
 */cmake-build-*/
 */_stage/
 */out/
+failed*
 
 # CMake generated
 CMakeCache.txt

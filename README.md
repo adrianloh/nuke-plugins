@@ -106,7 +106,7 @@ name via a table in `release.yml`.
   release.yml           # Orchestrator: dispatch dropdown + tag router
 
 scripts/
-  assemble-ndk-windows_x86_64.ps1  # Pull Windows NDK bits from a Nuke install
+  assemble-ndk-windows.ps1         # Pull Windows NDK bits from a Nuke install
   assemble-ndk-macos_arm64.ps1     # Pull macOS NDK bits from a mounted .dmg
 
 build.py                # One-button: trigger CI, poll, download binaries
@@ -125,7 +125,7 @@ contains only what's needed to link plugins: headers and CMake config files.
 It does **not** contain any Nuke binaries. To rebuild the tarball from a
 licensed Nuke install (if Nuke is updated):
 
-1. Run `scripts/assemble-ndk-windows_x86_64.ps1` on a Windows machine with
+1. Run `scripts/assemble-ndk-windows.ps1` on a Windows machine with
    Nuke installed.
 2. Run `scripts/assemble-ndk-macos_arm64.ps1` on Windows with a mounted mac
    Nuke `.dmg` (or adapt to run on macOS directly).
