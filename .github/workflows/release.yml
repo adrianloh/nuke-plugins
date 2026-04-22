@@ -19,10 +19,19 @@ on:
     tags:
       - "*-v*"
 
+# Top-level permissions set the ceiling for all jobs (including reusable
+# workflow calls). A job's own 'permissions:' block can only narrow this,
+# never widen it. We need 'contents: write' at the top so tag-release can
+# publish to GitHub Releases; the dispatch-build job narrows back to read.
+permissions:
+  contents: write
+
 jobs:
   # --- Manual build (dispatch) ----------------------------------------
   dispatch-build:
     if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
     uses: ./.github/workflows/build-plugin.yml
     with:
       plugin: ${{ inputs.plugin }}
