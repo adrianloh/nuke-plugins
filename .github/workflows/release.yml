@@ -4,14 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       plugin:
-        description: "Plugin to build"
+        description: "Plugin name (the directory name in the repo, e.g. BaseSixFour). Use the build.py script to discover what's buildable."
         required: true
-        type: choice
-        options:
-          - BaseSixFour
-          # Add new plugins here (must match directory name exactly):
-          # - webPReader
-          # - Loki
+        type: string
 
   push:
     # Tag format: <pluginname-lowercase>-v<semver>

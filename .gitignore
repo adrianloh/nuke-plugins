@@ -3,7 +3,6 @@
 */cmake-build-*/
 */_stage/
 */out/
-failed*
 
 # CMake generated
 CMakeCache.txt
@@ -24,6 +23,12 @@ Makefile
 *.ilk
 *.exp
 *.lib
+
+# ...except for shipped binaries inside any plugin's Release/ directory.
+# build.py drops compiled plugins into <plugin>/Release/<platform>/ for
+# the team to download via the GitHub web UI.
+!*/Release/**/*.dll
+!*/Release/**/*.dylib
 
 # NDK tarball (pulled fresh in CI)
 ndk.tar.gz

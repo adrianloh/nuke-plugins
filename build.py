@@ -1,35 +1,42 @@
 #!/usr/bin/env python3
 """
-build_nuke_plugin.py - Build a nuke-plugins plugin on GitHub Actions and
-                       download the compiled binaries to your Downloads folder.
-
-What this does:
-  1. Verifies your fork/repo exists and the token works.
-  2. Dispatches the 'Build / Release' workflow for the plugin you specify.
-  3. Polls the run until it finishes (typically 3-6 minutes).
-  4. Downloads the Windows .dll and macOS .dylib to your Downloads folder.
-
-Prerequisites:
-  - The repo 'nuke-plugins' exists under your GitHub account.
-  - You have a GitHub Personal Access Token with 'Actions: write' and
-    'Contents: read' scopes on that repo.
-  - pip install requests
+build.py - Build nuke-plugins on GitHub Actions and drop the compiled
+           binaries into the repo's <plugin>/Release/<platform>/ folders
+           so they can be committed and pushed for the team to download.
 
 Usage:
-  # Build BaseSixFour (default plugin)
-  python build_nuke_plugin.py
+  python build.py                  # List buildable plugins and exit
+  python build.py BaseSixFour      # Build one plugin
+  python build.py all              # Build every plugin sequentially
 
-  # Build a specific plugin
-  python build_nuke_plugin.py --plugin Loki
+  python build.py BaseSixFour --download
+                                   # Skip building; just download the
+                                   # artifacts from the most recent
+                                   # successful run for that plugin
 
-  # Just download the artifacts from the most recent successful run
-  # (no new build triggered)
-  python build_nuke_plugin.py --plugin BaseSixFour --download
+What is a "buildable plugin"?
+  Any top-level directory in the repo (sibling to this script) that
+  contains a CMakeLists.txt. The 'scripts/' and '.github/' folders are
+  ignored. Repo layout is the single source of truth for what's
+  buildable - no registry to maintain.
 
-  # Token resolution order:
-  #   1. --token <TOKEN>
-  #   2. $GITHUB_TOKEN environment variable
-  #   3. A folder named 'github_pat_<...>' sitting next to this script
+Output:
+  Compiled binaries land in:
+    <repo>/<Plugin>/Release/windows/<Plugin>.dll
+    <repo>/<Plugin>/Release/macos_arm64/<Plugin>.dylib
+
+  The script does not commit or push - that's your job:
+    git add */Release/
+    git commit -m "Update built binaries"
+    git push
+
+Token (in priority order):
+  1. --token <TOKEN>
+  2. $GITHUB_TOKEN environment variable
+  3. A folder named 'github_pat_<rest of token>' next to this script
+
+Prerequisites:
+  pip install requests
 """
 
 from __future__ import annotations
@@ -54,7 +61,16 @@ except ImportError:
 REPO_NAME         = "nuke-plugins"
 WORKFLOW_FILE     = "release.yml"   # The orchestrator in .github/workflows/
 DEFAULT_BRANCH    = "main"
-DEFAULT_PLUGIN    = "BaseSixFour"
+
+# Top-level directories to skip when discovering plugins.
+NON_PLUGIN_DIRS = {".github", ".git", "scripts", "__pycache__"}
+
+# Map an artifact's platform suffix to the in-repo Release subdirectory.
+# Artifact names are '<plugin>-<artifact_suffix>' (defined in build-plugin.yml).
+PLATFORM_DIR_MAP = {
+    "windows-x86_64": "windows",
+    "macos-arm64":    "macos_arm64",
+}
 
 # Poll settings
 POLL_INTERVAL_SEC = 10
@@ -66,6 +82,29 @@ POLL_TIMEOUT_MIN  = 30
 def log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def repo_root() -> Path:
+    """The directory the script lives in, which is the repo root."""
+    return Path(__file__).resolve().parent
+
+
+def discover_plugins() -> list[str]:
+    """Return sorted list of buildable plugin names. A plugin is any top-level
+    directory in the repo (excluding hidden + 'scripts/') that contains a
+    CMakeLists.txt."""
+    root = repo_root()
+    plugins = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name in NON_PLUGIN_DIRS:
+            continue
+        if entry.name.startswith("."):
+            continue
+        if (entry / "CMakeLists.txt").is_file():
+            plugins.append(entry.name)
+    return plugins
 
 
 def api_headers(token: str) -> dict:
@@ -99,8 +138,7 @@ def verify_token_and_repo(token: str, username: str) -> None:
 def trigger_workflow(token: str, username: str, plugin: str,
                      branch: str) -> float:
     """Dispatch the workflow and return the unix timestamp we captured
-    just before the API call. wait_for_run uses this to filter out stale
-    runs from previous dispatches."""
+    just before the API call."""
     log(f"Triggering '{WORKFLOW_FILE}' on branch '{branch}' for plugin '{plugin}'...")
     url = (f"https://api.github.com/repos/{username}/{REPO_NAME}"
            f"/actions/workflows/{WORKFLOW_FILE}/dispatches")
@@ -122,8 +160,6 @@ def trigger_workflow(token: str, username: str, plugin: str,
     if r.status_code == 422:
         sys.exit(
             f"ERROR: Workflow dispatch rejected (422).\n"
-            f"       Likely causes: plugin name not in the dropdown options, or\n"
-            f"       the branch has no workflow file.\n"
             f"       Response: {r.text}"
         )
     r.raise_for_status()
@@ -133,8 +169,7 @@ def trigger_workflow(token: str, username: str, plugin: str,
 def wait_for_run(token: str, username: str, trigger_time: float,
                  branch: str) -> dict:
     """Wait for a workflow run created strictly AFTER trigger_time.
-    Returns the run dict once it has reached a terminal state (success
-    or failure)."""
+    Returns the run dict on success. On failure, dumps logs and exits."""
     log("Waiting for the new workflow run to appear...")
 
     runs_url = (f"https://api.github.com/repos/{username}/{REPO_NAME}"
@@ -179,8 +214,6 @@ def wait_for_run(token: str, username: str, trigger_time: float,
     started = time.time()
     last_status = None
 
-    # Track per-job step progress so we can print "Windows: Build started"
-    # etc. as things happen.
     seen_step_states: dict = {}
 
     timeout = POLL_TIMEOUT_MIN * 60
@@ -190,12 +223,11 @@ def wait_for_run(token: str, username: str, trigger_time: float,
             sys.exit(f"ERROR: Build did not finish within {POLL_TIMEOUT_MIN} minutes. "
                      f"Check the live URL.")
 
-        # --- Top-level run status -------------------------------------------
         r = requests.get(run_url, headers=api_headers(token), timeout=30)
         r.raise_for_status()
         run = r.json()
-        status = run.get("status")       # queued | in_progress | completed
-        conclusion = run.get("conclusion")  # success | failure | cancelled | ...
+        status = run.get("status")
+        conclusion = run.get("conclusion")
 
         if status != last_status:
             mins = elapsed // 60
@@ -204,7 +236,6 @@ def wait_for_run(token: str, username: str, trigger_time: float,
                 + (f" conclusion={conclusion}" if conclusion else ""))
             last_status = status
 
-        # --- Per-job step progress ------------------------------------------
         jr = requests.get(jobs_url, headers=api_headers(token), timeout=30)
         if jr.ok:
             for job in jr.json().get("jobs", []):
@@ -222,30 +253,26 @@ def wait_for_run(token: str, username: str, trigger_time: float,
                         mins = elapsed // 60
                         log(f"  [{mins:>2}m]   > {job_name} :: {step_name}")
                     elif step_status == "completed":
-                        icon = "x" if step_conc != "success" else "+"
                         if step_conc in ("skipped", "cancelled"):
-                            continue  # too noisy
+                            continue
+                        icon = "x" if step_conc != "success" else "+"
                         mins = elapsed // 60
                         log(f"  [{mins:>2}m]   {icon} {job_name} :: {step_name} ({step_conc})")
 
-        # --- Terminal? ------------------------------------------------------
         if status == "completed":
             if conclusion == "success":
                 log(f"Build finished successfully in {elapsed}s.")
+                return run
             else:
-                # Surface everything useful for debugging: live URL, log
-                # download links, and auto-saved log files.
                 report_failure(token, username, run, jobs_url)
                 sys.exit(1)
-            return run
 
         time.sleep(POLL_INTERVAL_SEC)
 
 
 def report_failure(token: str, username: str, run: dict, jobs_url: str) -> None:
     """On workflow failure, print everything useful for debugging and
-    auto-download the log files for any failed job(s) to the current
-    directory so they can be shared easily."""
+    auto-download log files for any failed job(s) so they can be shared."""
     run_id = run["id"]
     html_url = run["html_url"]
 
@@ -256,7 +283,6 @@ def report_failure(token: str, username: str, run: dict, jobs_url: str) -> None:
     print(f"  Live URL:  {html_url}")
     print("")
 
-    # --- Per-job status + log URLs ------------------------------------------
     jr = requests.get(jobs_url, headers=api_headers(token), timeout=30)
     failed_jobs = []
     if jr.ok:
@@ -268,7 +294,6 @@ def report_failure(token: str, username: str, run: dict, jobs_url: str) -> None:
             print(f"    [{conc:>9}]  {name}")
             if job.get("conclusion") not in (None, "success", "skipped"):
                 failed_jobs.append(job)
-                # Identify the first failed step for a quick pointer
                 for step in job.get("steps") or []:
                     if step.get("conclusion") not in (None, "success", "skipped"):
                         print(f"                first failing step: "
@@ -276,16 +301,11 @@ def report_failure(token: str, username: str, run: dict, jobs_url: str) -> None:
                               f"({step.get('conclusion')})")
                         break
 
-    # --- Download logs of failed jobs to cwd --------------------------------
-    # GitHub provides per-job logs as plain text via:
-    #   GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs
-    # This 302's to a short-lived blob URL.
     downloaded: list[Path] = []
     errors: list[str] = []
     out_dir = Path.cwd()
     for job in failed_jobs:
         job_id = job["id"]
-        # Safe filename: replace anything non-alphanum/dash/underscore
         safe = "".join(c if c.isalnum() or c in "-_" else "_"
                        for c in job.get("name", f"job-{job_id}"))
         out_path = out_dir / f"failed-run-{run['run_number']}-{safe}.log"
@@ -303,7 +323,6 @@ def report_failure(token: str, username: str, run: dict, jobs_url: str) -> None:
         except Exception as e:
             errors.append(f"{safe}: {e}")
 
-    # --- Also fetch the full zipped logs for the whole run ------------------
     zip_path = out_dir / f"failed-run-{run['run_number']}-all-logs.zip"
     try:
         logs_url = (f"https://api.github.com/repos/{username}/{REPO_NAME}"
@@ -349,16 +368,35 @@ def list_artifacts(token: str, username: str, run_id: int) -> list[dict]:
     return r.json().get("artifacts", [])
 
 
-def download_artifact(token: str, username: str, artifact: dict,
-                      out_dir: Path) -> list[Path]:
-    """Download one artifact (a zip from GitHub) and extract its contents
-    into out_dir. Returns the list of extracted file paths."""
+def artifact_to_release_subdir(artifact_name: str, plugin: str) -> Optional[str]:
+    """Given an artifact name like 'BaseSixFour-windows-x86_64', return the
+    in-repo Release subdir name ('windows', 'macos_arm64', etc.). Returns
+    None if the artifact name doesn't fit the expected pattern."""
+    prefix = f"{plugin}-"
+    if not artifact_name.startswith(prefix):
+        return None
+    suffix = artifact_name[len(prefix):]
+    return PLATFORM_DIR_MAP.get(suffix)
+
+
+def download_artifact_to_release(token: str, username: str,
+                                 artifact: dict, plugin: str) -> list[Path]:
+    """Download an artifact zip from GitHub and extract its contents to
+    <repo>/<plugin>/Release/<platform>/. Returns the list of extracted files."""
     name = artifact["name"]
     size = artifact.get("size_in_bytes", 0)
+
+    sub = artifact_to_release_subdir(name, plugin)
+    if sub is None:
+        log(f"WARNING: artifact '{name}' has unexpected suffix; skipping.")
+        return []
+
+    out_dir = repo_root() / plugin / "Release" / sub
+
     url = (f"https://api.github.com/repos/{username}/{REPO_NAME}"
            f"/actions/artifacts/{artifact['id']}/zip")
 
-    log(f"Downloading '{name}' ({size / 1024:.0f} KB)...")
+    log(f"Downloading '{name}' ({size / 1024:.0f} KB) -> {out_dir.relative_to(repo_root())}/")
     r = requests.get(url, headers=api_headers(token),
                      stream=True, allow_redirects=True, timeout=120)
     r.raise_for_status()
@@ -372,7 +410,6 @@ def download_artifact(token: str, username: str, artifact: dict,
     out_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(data) as zf:
         for member in zf.namelist():
-            # Skip directory entries
             if member.endswith("/"):
                 continue
             target = out_dir / Path(member).name
@@ -400,12 +437,9 @@ def find_latest_successful_run(token: str, username: str, plugin: str,
     if not runs:
         sys.exit(
             f"ERROR: No successful workflow runs found on branch '{branch}'.\n"
-            f"       Trigger one first (run without --download)."
+            f"       Trigger one first: rerun without --download."
         )
 
-    # Walk runs newest-first. A run "matches" the plugin if it has an
-    # artifact named '<plugin>-*'. This correctly skips runs for other
-    # plugins when asking for one specific plugin.
     for run in runs:
         artifacts = list_artifacts(token, username, run["id"])
         for a in artifacts:
@@ -421,27 +455,76 @@ def find_latest_successful_run(token: str, username: str, plugin: str,
     )
 
 
+# --- One-plugin orchestration ------------------------------------------------
+
+def build_one(plugin: str, *, token: str, username: str, branch: str,
+              download_only: bool) -> list[Path]:
+    """Trigger (or skip-to-download) one plugin and drop its artifacts into
+    the in-repo Release dirs. Returns the list of extracted file paths."""
+    print("")
+    print("#" * 70)
+    print(f"#  {plugin}")
+    print("#" * 70)
+
+    if download_only:
+        run = find_latest_successful_run(token, username, plugin, branch)
+    else:
+        trigger_time = trigger_workflow(token, username, plugin, branch)
+        run = wait_for_run(token, username, trigger_time, branch)
+
+    artifacts = list_artifacts(token, username, run["id"])
+    plugin_artifacts = [a for a in artifacts
+                        if a["name"].startswith(f"{plugin}-")]
+
+    if not plugin_artifacts:
+        sys.exit(f"ERROR: Run #{run['run_number']} has no artifacts for "
+                 f"plugin '{plugin}'.")
+
+    log(f"Found {len(plugin_artifacts)} artifact(s) for {plugin}:")
+    for a in plugin_artifacts:
+        flag = " (expired)" if a.get("expired") else ""
+        log(f"  - {a['name']}{flag}")
+
+    extracted: list[Path] = []
+    for a in plugin_artifacts:
+        if a.get("expired"):
+            log(f"Skipping expired artifact: {a['name']}")
+            continue
+        extracted.extend(
+            download_artifact_to_release(token, username, a, plugin)
+        )
+
+    return extracted
+
+
 # --- Main --------------------------------------------------------------------
 
-def default_downloads_dir() -> Path:
-    if os.name == "nt":
-        return Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads"
-    return Path.home() / "Downloads"
-
-
 def find_token_in_script_dir() -> Optional[str]:
-    """Look for a folder named like 'github_pat_...' next to this script,
-    and return its name. This lets you stash the token as a folder name
-    so you don't have to set $GITHUB_TOKEN every shell session."""
-    script_dir = Path(__file__).resolve().parent
-    matches = [p.name for p in script_dir.iterdir()
+    """Look for a folder named like 'github_pat_...' next to this script."""
+    matches = [p.name for p in repo_root().iterdir()
                if p.is_dir() and p.name.startswith("github_pat_")]
     if not matches:
         return None
     if len(matches) > 1:
-        log(f"WARNING: Multiple github_pat_* folders found next to script; "
-            f"using {matches[0]}")
+        log(f"WARNING: Multiple github_pat_* folders found; using {matches[0]}")
     return matches[0]
+
+
+def print_plugins_and_exit(plugins: list[str], code: int = 0) -> None:
+    if not plugins:
+        print("No buildable plugins found in the repo.")
+        print("(A buildable plugin is any top-level directory with a CMakeLists.txt.)")
+    else:
+        print("Buildable plugins:")
+        for p in plugins:
+            print(f"  - {p}")
+        print("")
+        print("Usage:")
+        print("  python build.py <plugin>          # build one")
+        print("  python build.py all               # build every plugin sequentially")
+        print("  python build.py <plugin> --download")
+        print("                                     # skip the build; just download last successful")
+    sys.exit(code)
 
 
 def main() -> None:
@@ -449,23 +532,41 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("target", nargs="?", default=None,
+                   help="Plugin name to build, or 'all'. Omit to list buildable plugins.")
     p.add_argument("--username", default="adrianloh",
                    help="GitHub username (owner of the nuke-plugins repo). "
                         "Default: adrianloh.")
-    p.add_argument("--plugin", default=DEFAULT_PLUGIN,
-                   help=f"Plugin directory name to build. Default: {DEFAULT_PLUGIN}.")
     p.add_argument("--branch", default=DEFAULT_BRANCH,
                    help=f"Branch to build from. Default: {DEFAULT_BRANCH}.")
     p.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"),
                    help="GitHub Personal Access Token. Defaults to $GITHUB_TOKEN, "
                         "or to the name of a 'github_pat_*' folder next to this script.")
-    p.add_argument("--download-dir", type=Path, default=None,
-                   help="Where to save the built plugin binaries. Default: "
-                        "<Downloads>/<plugin>/")
     p.add_argument("--download", action="store_true",
                    help="Skip triggering a build; just download artifacts from "
-                        "the most recent successful run for this plugin.")
+                        "the most recent successful run for the chosen plugin(s).")
     args = p.parse_args()
+
+    plugins = discover_plugins()
+
+    # No-arg invocation: show available plugins and exit
+    if args.target is None:
+        print_plugins_and_exit(plugins)
+
+    # Resolve target -> list of plugins to build
+    target_lower = args.target.lower()
+    if target_lower == "all":
+        if not plugins:
+            sys.exit("ERROR: No buildable plugins found in the repo.")
+        to_build = plugins
+    else:
+        # Case-insensitive name match against discovered plugins
+        match = next((p for p in plugins if p.lower() == target_lower), None)
+        if match is None:
+            print(f"ERROR: '{args.target}' is not a buildable plugin.")
+            print("")
+            print_plugins_and_exit(plugins, code=2)
+        to_build = [match]
 
     # Token resolution
     if not args.token:
@@ -480,59 +581,54 @@ def main() -> None:
             "       folder named 'github_pat_<rest of token>' next to this script."
         )
 
-    # Output dir
-    if args.download_dir is None:
-        args.download_dir = default_downloads_dir() / args.plugin
-
     verify_token_and_repo(args.token, args.username)
 
-    # -- --download mode: just grab the latest artifacts ----------------------
-    if args.download:
-        run = find_latest_successful_run(args.token, args.username,
-                                         args.plugin, args.branch)
-    else:
-        # -- Normal mode: trigger + poll + download --------------------------
-        trigger_time = trigger_workflow(args.token, args.username,
-                                        args.plugin, args.branch)
-        run = wait_for_run(args.token, args.username, trigger_time, args.branch)
+    # -- Build each in turn --------------------------------------------------
+    summary: list[tuple[str, list[Path]]] = []
+    for plugin in to_build:
+        try:
+            extracted = build_one(
+                plugin,
+                token=args.token,
+                username=args.username,
+                branch=args.branch,
+                download_only=args.download,
+            )
+            summary.append((plugin, extracted))
+        except SystemExit:
+            # build_one already printed the failure context. In 'all' mode
+            # we keep going so the rest of the plugins still try.
+            summary.append((plugin, []))
+            if len(to_build) == 1:
+                raise
 
-    # -- Download artifacts ---------------------------------------------------
-    artifacts = list_artifacts(args.token, args.username, run["id"])
-    plugin_artifacts = [a for a in artifacts
-                        if a["name"].startswith(f"{args.plugin}-")]
-
-    if not plugin_artifacts:
-        sys.exit(f"ERROR: Run #{run['run_number']} has no artifacts for "
-                 f"plugin '{args.plugin}'.")
-
-    log(f"Found {len(plugin_artifacts)} artifact(s) for {args.plugin}:")
-    for a in plugin_artifacts:
-        flag = " (expired)" if a.get("expired") else ""
-        log(f"  - {a['name']}{flag}")
-
-    all_extracted: list[Path] = []
-    for a in plugin_artifacts:
-        if a.get("expired"):
-            log(f"Skipping expired artifact: {a['name']}")
+    # -- Final summary -------------------------------------------------------
+    print("")
+    print("=" * 70)
+    print("  Summary")
+    print("=" * 70)
+    any_success = False
+    for plugin, extracted in summary:
+        if not extracted:
+            print(f"  {plugin}:  FAILED")
             continue
-        extracted = download_artifact(args.token, args.username, a,
-                                      args.download_dir)
-        all_extracted.extend(extracted)
-
-    print("")
-    print("=" * 60)
-    print(f"  {args.plugin} build complete")
-    print(f"  Output dir: {args.download_dir}")
-    for f in all_extracted:
-        print(f"    {f.name}  ({f.stat().st_size / 1024:.0f} KB)")
-    print("=" * 60)
-    print("")
-    print("Install:")
-    if os.name == "nt":
-        print(f"  Copy the .dll to %USERPROFILE%\\.nuke\\")
-    else:
-        print(f"  Copy the .dylib to ~/.nuke/")
-    print("  Restart Nuke.")
+        any_success = True
+        print(f"  {plugin}:")
+        for f in extracted:
+            try:
+                rel = f.relative_to(repo_root())
+            except ValueError:
+                rel = f
+            size_kb = f.stat().st_size / 1024
+            print(f"    {rel}  ({size_kb:,.0f} KB)")
+    print("=" * 70)
+    if any_success:
+        print("")
+        print("Next: review the changes and commit:")
+        print("  git status")
+        print("  git add */Release/")
+        print("  git commit -m 'Update built binaries'")
+        print("  git push")
 
 
 if __name__ == "__main__":
