@@ -1,15 +1,14 @@
 // LokiDecode.cpp
 //
-// Pixel-to-text decoder for Nuke. Terminal/inspection node.
-// Takes encoded pixels from upstream, passes them through unchanged,
-// and decodes the text into a read-only knob.
+// Pixel-to-text decoder for Nuke. Decodes upstream Loki-encoded pixels
+// into the `prompt_text` knob.
 //
-// The Viewer pulls through this node, so the decoded text is always
-// current when upstream changes.
-//
-// Encoding expected: first 4 bytes = string length (LE uint32),
-// then raw string bytes packed R-G-B sequentially across pixels,
-// row by row top-down.
+// RGB passes through unchanged so downstream Loki nodes still see the
+// encoded text. Alpha is filled with random noise every engine() call,
+// and a monotonic counter is mixed into the hash via append(). Together
+// these make the node's output genuinely change on every pull, which
+// stops Nuke from caching us as a noop and short-circuiting _open()
+// — without that, the decoded text would go stale when upstream changed.
 
 #include "DDImage/DDWindows.h"
 #include "DDImage/Iop.h"
@@ -20,9 +19,10 @@
 
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <random>
 #include <string>
 #include <vector>
-#include <chrono>
 
 using namespace DD::Image;
 
@@ -33,16 +33,20 @@ static const int LK_HEADER = 4;
 
 static const char* const CLASS = "LokiDecode";
 static const char* const HELP =
-  "Decodes text from upstream Loki-encoded pixels.\n\n"
-  "Passes pixels through unchanged. The decoded text appears in\n"
-  "the in-panel watcher widget and is accessible via Python:\n"
-  "  nuke.toNode('LokiDecode1')['prompt_text'].value()";
+  "Decodes text from upstream Loki-encoded pixels into the\n"
+  "`prompt_text` knob.\n\n"
+  "RGB passes through unchanged. Alpha carries random noise to\n"
+  "force re-evaluation when upstream changes.\n\n"
+  "Read from Python:\n"
+  "  nuke.toNode('LokiDecode1')['prompt_text'].value()\n\n"
+  "Read from a TCL expression:\n"
+  "  [value LokiDecode1.prompt_text]";
 
 
 class LokiDecode : public Iop
 {
   const char* _textKnob;
-  std::string _decodedText;
+  std::atomic<uint64_t> _tick;
 
 public:
 
@@ -50,35 +54,31 @@ public:
   int maximum_inputs() const override { return 1; }
 
   LokiDecode(Node* node) : Iop(node),
-    _textKnob(nullptr)
+    _textKnob(nullptr),
+    _tick(0)
   {}
 
   ~LokiDecode() override {}
 
   void knobs(Knob_Callback f) override
   {
-    // Single-line knob. Populated by _open() from upstream pixels.
-    // OUTPUT_ONLY so set_text() never affects the node hash.
-    // Hidden (INVISIBLE) because humans should watch via the custom
-    // Qt widget added by Python on node creation — this knob is the
-    // data source for your pipeline, not something to look at.
     String_knob(f, &_textKnob, "prompt_text", "prompt text");
-    Tooltip(f, "Decoded text from upstream pixels.\n"
-               "Populated by the C++ decoder. Access via Python:\n"
-               "  node['prompt_text'].value()");
-    SetFlags(f, Knob::STARTLINE | Knob::OUTPUT_ONLY | Knob::INVISIBLE);
+    Tooltip(f, "Decoded text from upstream pixels.");
+    SetFlags(f, Knob::STARTLINE | Knob::INVISIBLE);
   }
 
-  // Ensure _open() always runs by preventing stale cache hits.
-  // Time-based hash means Nuke always sees us as "different."
+  // Monotonic counter mixed into the hash so Nuke sees us as different
+  // on every pull. Pattern from NDKExamples/examples/Socket.cpp.
   void append(Hash& hash) override
   {
-    hash.append((U64)std::chrono::steady_clock::now().time_since_epoch().count());
+    hash.append(_tick.fetch_add(1) + 1);
   }
 
   void _validate(bool for_real) override
   {
+    input(0)->validate(for_real);
     copy_info();
+    info_.turn_on(Mask_Alpha);
   }
 
   void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
@@ -86,15 +86,17 @@ public:
     input(0)->request(0, 0, LK_W, LK_H, Mask_RGB, count);
   }
 
-  // _open() runs after _request(), on a worker thread, locked,
-  // before any engine() calls. Decode the full upstream image here.
+  // _open() runs on a worker thread, locked, before any engine() call.
+  // Pixel reads from input(0) are reliable here (unlike in _validate).
+  // set_text() from a worker thread is safe as long as the knob is not
+  // OUTPUT_ONLY — Nuke marshals the actual mutation to the main thread.
   void _open() override
   {
-    Interest interest(input0(), 0, 0, LK_W, LK_H, Mask_RGB, true);
-    interest.unlock();
-
     const int totalBytes = LK_W * LK_H * LK_BPP;
     std::vector<unsigned char> buf(totalBytes, 0);
+
+    Interest interest(input0(), 0, 0, LK_W, LK_H, Mask_RGB, true);
+    interest.unlock();
 
     for (int y = 0; y < LK_H; y++) {
       Row row(0, LK_W);
@@ -111,23 +113,38 @@ public:
       }
     }
 
-    _decodedText.clear();
+    std::string decoded;
     if (totalBytes >= LK_HEADER) {
       uint32_t len = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
       if (len > 0 && len <= (uint32_t)(totalBytes - LK_HEADER)) {
-        _decodedText.assign((const char*)(buf.data() + LK_HEADER), len);
+        decoded.assign((const char*)(buf.data() + LK_HEADER), len);
       }
     }
 
     Knob* k = knob("prompt_text");
     if (k)
-      k->set_text(_decodedText.c_str());
+      k->set_text(decoded.c_str());
   }
 
-  // Pass input pixels through unchanged
+  // Pass RGB through. Fill alpha with random noise — see file header
+  // for why this matters.
   void engine(int y, int x, int r, ChannelMask channels, Row& row) override
   {
-    row.get(input0(), y, x, r, channels);
+    ChannelSet fromInput(channels);
+    fromInput &= Mask_RGB;
+    if (fromInput) {
+      row.get(input0(), y, x, r, fromInput);
+    }
+
+    if (channels & Mask_Alpha) {
+      thread_local std::mt19937 rng(
+        (uint32_t)(uintptr_t)&row ^ (uint32_t)y ^ (uint32_t)_tick.load());
+      std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+      float* dst = row.writable(Chan_Alpha) + x;
+      float* end = dst + (r - x);
+      while (dst < end) *dst++ = dist(rng);
+    }
   }
 
   const char* Class() const override { return CLASS; }
